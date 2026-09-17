@@ -29,10 +29,16 @@ import org.apache.bcel.Const;
 import org.apache.bcel.generic.ALOAD;
 import org.apache.bcel.generic.ATHROW;
 import org.apache.bcel.generic.CodeExceptionGen;
+import org.apache.bcel.generic.ConstantPoolGen;
 import org.apache.bcel.generic.IF_ACMPNE;
+import org.apache.bcel.generic.INVOKEINTERFACE;
+import org.apache.bcel.generic.INVOKESPECIAL;
+import org.apache.bcel.generic.INVOKEVIRTUAL;
 import org.apache.bcel.generic.Instruction;
 import org.apache.bcel.generic.InstructionHandle;
+import org.apache.bcel.generic.InvokeInstruction;
 import org.apache.bcel.generic.MethodGen;
+import org.apache.bcel.generic.NEW;
 import org.apache.bcel.generic.ObjectType;
 import org.apache.bcel.generic.ReferenceType;
 import org.apache.bcel.generic.Type;
@@ -662,12 +668,22 @@ public class IsNullValueAnalysis extends FrameDataflowAnalysis<IsNullValue, IsNu
 
         final short lastInSourceOpcode = lastInSourceHandle.getInstruction().getOpcode();
         if (lastInSourceOpcode == Const.IFEQ || lastInSourceOpcode == Const.IFNE) {
-            // check for instanceof check
             InstructionHandle prev = lastInSourceHandle.getPrev();
             if (prev == null) {
                 return null;
             }
             short secondToLastOpcode = prev.getInstruction().getOpcode();
+
+            // Check for isEmpty() on a freshly constructed empty collection.
+            // If the receiver was created by NEW + no-arg <init> of a Collection type
+            // and has not escaped, isEmpty() always returns true, making one branch infeasible.
+            IsNullConditionDecision freshEmptyDecision = getFreshEmptyCollectionDecision(
+                    basicBlock, prev, lastInSourceOpcode);
+            if (freshEmptyDecision != null) {
+                return freshEmptyDecision;
+            }
+
+            // check for instanceof check
             // System.out.println("Second last opcode: " +
             // Const.Const.getOpcodeName(secondToLastOpcode));
             if (secondToLastOpcode != Const.INSTANCEOF) {
@@ -866,6 +882,196 @@ public class IsNullValueAnalysis extends FrameDataflowAnalysis<IsNullValue, IsNu
             fallThroughDecision = ifnull ? IsNullValue.pathSensitiveNonNullValue() : IsNullValue.pathSensitiveNullValue();
         }
         return new IsNullConditionDecision(prevTopValue, ifcmpDecision, fallThroughDecision);
+    }
+
+    /**
+     * Check if the previous instruction is an INVOKEVIRTUAL/INVOKEINTERFACE calling
+     * isEmpty()Z on a freshly constructed empty collection. If so, isEmpty() always
+     * returns true, and the branch where isEmpty() would return false is infeasible.
+     *
+     * @param basicBlock        the basic block ending with the branch
+     * @param isEmptyCallHandle the instruction handle of the potential isEmpty() call
+     * @param branchOpcode      the branch opcode (IFEQ or IFNE)
+     * @return an IsNullConditionDecision marking the infeasible branch, or null
+     */
+    private @CheckForNull IsNullConditionDecision getFreshEmptyCollectionDecision(
+            BasicBlock basicBlock, InstructionHandle isEmptyCallHandle, short branchOpcode) {
+        Instruction prevIns = isEmptyCallHandle.getInstruction();
+        if (!(prevIns instanceof INVOKEVIRTUAL) && !(prevIns instanceof INVOKEINTERFACE)) {
+            return null;
+        }
+
+        InvokeInstruction invoke = (InvokeInstruction) prevIns;
+        ConstantPoolGen cpg = methodGen.getConstantPool();
+        String methodName = invoke.getMethodName(cpg);
+        String methodSig = invoke.getSignature(cpg);
+
+        // Only handle isEmpty()Z
+        if (!"isEmpty".equals(methodName) || !"()Z".equals(methodSig)) {
+            return null;
+        }
+
+        // Check if the receiver type is a subtype of java.util.Collection
+        String className = invoke.getClassName(cpg);
+        try {
+            ObjectType receiverType = new ObjectType(className);
+            ObjectType collectionType = new ObjectType("java.util.Collection");
+            if (!Hierarchy.isSubtype(receiverType, collectionType)) {
+                return null;
+            }
+        } catch (ClassNotFoundException e) {
+            AnalysisContext.reportMissingClass(e);
+            return null;
+        }
+
+        // Get the receiver's ValueNumber at the isEmpty() call site.
+        // isEmpty()Z consumes one stack operand (the receiver).
+        Location atIsEmpty = new Location(isEmptyCallHandle, basicBlock);
+        ValueNumberFrame vnaFrame;
+        try {
+            vnaFrame = vnaDataflow.getFactAtLocation(atIsEmpty);
+        } catch (DataflowAnalysisException e) {
+            return null;
+        }
+        if (!vnaFrame.isValid()) {
+            return null;
+        }
+        ValueNumber receiverVN;
+        try {
+            receiverVN = vnaFrame.getStackValue(0);
+        } catch (DataflowAnalysisException e) {
+            return null;
+        }
+
+        // Scan backward through all locations before the isEmpty() call to check:
+        // 1. The receiver was produced by a NEW instruction
+        // 2. The only INVOKESPECIAL on it before isEmpty() was <init>()V (no-arg constructor)
+        // 3. The value did not escape (no other method call with it as argument,
+        //    no PUTFIELD/PUTSTATIC storing it)
+        if (!isReceiverFreshEmptyCollection(atIsEmpty, receiverVN)) {
+            return null;
+        }
+
+        // isEmpty() on a fresh empty collection always returns true (1).
+        // IFEQ branches when the value is 0 (false) — infeasible for fresh empty collection.
+        // IFNE branches when the value is 1 (true) — always taken for fresh empty collection.
+        IsNullValue feasibleDecision = IsNullValue.pathSensitiveNonNullValue();
+        if (branchOpcode == Const.IFEQ) {
+            // IFEQ: jump-branch is infeasible (isEmpty never returns false)
+            return new IsNullConditionDecision(null, null, feasibleDecision);
+        } else {
+            // IFNE: fall-through is infeasible (isEmpty always returns true, so IFNE always jumps)
+            return new IsNullConditionDecision(null, feasibleDecision, null);
+        }
+    }
+
+    /**
+     * Check whether the given value number represents a freshly constructed empty
+     * collection — i.e., created by NEW + no-arg {@code <init>()V} with no
+     * intervening escape before the given location.
+     */
+    private boolean isReceiverFreshEmptyCollection(Location beforeLocation, ValueNumber receiverVN) {
+        boolean sawNew = false;
+        boolean sawInit = false;
+
+        for (Location loc : cfg.orderedLocations()) {
+            // Stop scanning once we reach the isEmpty() call location
+            if (loc.getHandle().getPosition() >= beforeLocation.getHandle().getPosition()) {
+                break;
+            }
+
+            Instruction ins = loc.getHandle().getInstruction();
+
+            // Check if this instruction produced the receiver value number via NEW
+            if (ins instanceof NEW) {
+                try {
+                    ValueNumberFrame vnaAfter = vnaDataflow.getFactAfterLocation(loc);
+                    if (vnaAfter.isValid() && vnaAfter.getTopValue().equals(receiverVN)) {
+                        sawNew = true;
+                    }
+                } catch (DataflowAnalysisException e) {
+                    // ignore
+                }
+                continue;
+            }
+
+            if (!sawNew) {
+                continue;
+            }
+
+            // Check for <init>()V call on the receiver (expected after NEW)
+            if (ins instanceof INVOKESPECIAL) {
+                INVOKESPECIAL invokeSpecial = (INVOKESPECIAL) ins;
+                ConstantPoolGen cpg = methodGen.getConstantPool();
+                if ("<init>".equals(invokeSpecial.getMethodName(cpg))
+                        && "()V".equals(invokeSpecial.getSignature(cpg))) {
+                    try {
+                        ValueNumberFrame vnaAt = vnaDataflow.getFactAtLocation(loc);
+                        if (vnaAt.isValid()) {
+                            // The receiver of <init> is 'this', which is at stack position
+                            // equal to the number of arguments (0 args for ()V, so position 0).
+                            ValueNumber initReceiver = vnaAt.getStackValue(0);
+                            if (initReceiver.equals(receiverVN)) {
+                                sawInit = true;
+                                continue;
+                            }
+                        }
+                    } catch (DataflowAnalysisException e) {
+                        // ignore
+                    }
+                }
+                // INVOKESPECIAL with our receiver but not a no-arg <init> — escape
+                if (involvesValueNumber(loc, receiverVN)) {
+                    return false;
+                }
+                continue;
+            }
+
+            // Any other invoke instruction involving the receiver means it escaped
+            if (ins instanceof InvokeInstruction) {
+                if (involvesValueNumber(loc, receiverVN)) {
+                    return false;
+                }
+                continue;
+            }
+
+            // PUTFIELD/PUTSTATIC storing the receiver means it escaped
+            short opcode = ins.getOpcode();
+            if (opcode == Const.PUTFIELD || opcode == Const.PUTSTATIC
+                    || opcode == Const.AASTORE) {
+                if (involvesValueNumber(loc, receiverVN)) {
+                    return false;
+                }
+            }
+        }
+
+        return sawNew && sawInit;
+    }
+
+    /**
+     * Check whether the given value number appears in any consumed stack slot
+     * at the given location.
+     */
+    private boolean involvesValueNumber(Location loc, ValueNumber targetVN) {
+        try {
+            ValueNumberFrame vnaAt = vnaDataflow.getFactAtLocation(loc);
+            if (!vnaAt.isValid()) {
+                return false;
+            }
+            Instruction ins = loc.getHandle().getInstruction();
+            int consumed = ins.consumeStack(methodGen.getConstantPool());
+            if (consumed == Const.UNPREDICTABLE) {
+                return false;
+            }
+            for (int i = 0; i < consumed; i++) {
+                if (vnaAt.getStackValue(i).equals(targetVN)) {
+                    return true;
+                }
+            }
+        } catch (DataflowAnalysisException e) {
+            // ignore
+        }
+        return false;
     }
 
     /**
